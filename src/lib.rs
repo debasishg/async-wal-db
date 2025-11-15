@@ -1,10 +1,12 @@
 mod wal_storage;
 mod transaction;
 mod database;
+mod lmdb_storage;
 
 pub use wal_storage::WalStorage;
 pub use transaction::{Transaction, TxState};
 pub use database::Database;
+pub use lmdb_storage::LmdbStorage;
 
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::AtomicU64;

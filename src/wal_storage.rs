@@ -13,15 +13,82 @@ use tempfile::TempDir;
 #[cfg(test)]
 use tokio::test as async_test;
 
+/// Lock-Free Write-Ahead Log (WAL) Storage
+///
+/// ## Architecture
+///
+/// This implementation uses a lock-free design to maximize concurrent write throughput:
+///
+/// ```text
+/// Thread 1 ──┐
+///            │
+/// Thread 2 ──┼──▶ SegQueue.push()  ──▶  [Queue]
+///            │     (CAS atomic ops)         │
+/// Thread N ──┘     No locks!                │
+///                                           ▼
+///                                    Background Thread
+///                                    drains & writes
+///                                    (Mutex only here)
+/// ```
+///
+/// ## Lock-Free Concurrency with SegQueue
+///
+/// The `SegQueue` from crossbeam provides lock-free concurrent access using
+/// Compare-And-Swap (CAS) atomic operations:
+///
+/// 1. **Multiple threads call `push()` simultaneously**
+/// 2. **Each thread independently**:
+///    - Reads current tail pointer atomically
+///    - Prepares to insert its entry
+///    - Uses CAS: "If tail is still X, update to Y"
+///    - If CAS fails (another thread modified tail), retry with new tail
+/// 3. **No mutex needed** - hardware atomics handle coordination
+///
+/// ### Why This is Fast
+///
+/// **Hot Path (append)**:
+/// - ✅ No locks or mutexes
+/// - ✅ No thread blocking
+/// - ✅ CPU cache-friendly operations
+/// - ✅ Scales linearly with CPU cores
+///
+/// **Cold Path (flush)**:
+/// - Single background thread batches entries
+/// - Mutex protects `BufWriter<File>` (required for file I/O)
+/// - But doesn't block appends!
+///
+/// ### Performance Results
+///
+/// From benchmarks (see `PHASE1_LOCK_FREE_WAL.md`):
+/// - **128 concurrent threads**: 9.12x speedup (1,960 txn/s)
+/// - **High contention**: Only 3.95% degradation
+/// - **Latency**: Reduced from 4.65ms to 0.51ms
+///
+/// If there were locks on `append()`, contention would be much worse at high thread counts.
+///
+/// ## Components
+///
+/// - `pending`: Lock-free queue (`SegQueue`) for concurrent appends
+/// - `file`: Mutex-protected `BufWriter` (only used by background flusher)
+/// - `flusher_handle`: Background task that periodically drains queue to disk
+/// - `shutdown`: Atomic flag for graceful termination
+/// - `flush_notify`: Signal for immediate flush requests
 #[derive(Clone)]
 pub struct WalStorage {
     inner: Arc<Mutex<InnerWal>>,
     pub(crate) path: String,
-    // Lock-free queue for pending writes
+    /// Lock-free queue for pending writes - multiple threads can push concurrently
     pending: Arc<SegQueue<WalEntry>>,
-    // Background flusher control
+    /// Background flusher task handle. The flusher runs on a configurable interval
+    /// (default 10ms), drains all pending entries from the queue, and batches them
+    /// into a single disk write. This amortizes I/O overhead across many operations.
+    /// Can be stopped gracefully via `stop_flusher()` which joins the task and performs
+    /// a final flush to ensure no data loss.
     flusher_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
+    /// Atomic shutdown flag - when set to true, signals the background flusher to terminate
     shutdown: Arc<AtomicBool>,
+    /// Notify mechanism for immediate flush requests - allows explicit flush() calls
+    /// to wake the background flusher without waiting for the next interval tick
     flush_notify: Arc<Notify>,
 }
 
