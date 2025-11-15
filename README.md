@@ -143,7 +143,7 @@ thiserror = "2.0"          # Error handling
 
 ## License
 
-This project is available under your preferred open-source license.
+MIT License - see [LICENSE](LICENSE) file for details.
 
 ## Documentation
 
