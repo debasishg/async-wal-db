@@ -1,6 +1,6 @@
 # Async WAL Database
 
-A high-performance, lock-free Write-Ahead Log (WAL) database implementation in Rust with async/await support.
+A high-performance, lock-free Write-Ahead Log (WAL) database implementation in Rust with async/await support. **This is just a playground for learning and experimentation - not recommended for any serious use**.
 
 ## Features
 
