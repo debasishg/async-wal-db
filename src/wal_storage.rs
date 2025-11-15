@@ -97,6 +97,17 @@ struct InnerWal {
 }
 
 impl WalStorage {
+    /// Creates a new WAL storage instance at the specified path.
+    ///
+    /// Opens (or creates) the WAL file in append mode. The file uses a buffered
+    /// writer for efficient I/O. The background flusher is NOT started automatically -
+    /// call `start_flusher()` separately.
+    ///
+    /// # Arguments
+    /// * `path` - File path for the WAL log
+    ///
+    /// # Panics
+    /// Panics if the file cannot be opened (permissions, disk full, etc.)
     pub async fn new<P: AsRef<Path>>(path: P) -> Self {
         let file = OpenOptions::new()
             .create(true)
@@ -117,7 +128,19 @@ impl WalStorage {
         }
     }
 
-    /// Lock-free append to pending queue
+    /// Appends a WAL entry to the lock-free pending queue.
+    ///
+    /// This method is completely lock-free using `SegQueue::push()` with CAS atomics.
+    /// Multiple threads can append concurrently without blocking. The entry is not
+    /// immediately written to disk - it will be flushed by the background task.
+    ///
+    /// Also notifies the background flusher that work is available (non-blocking).
+    ///
+    /// # Arguments
+    /// * `entry` - WAL entry to append
+    ///
+    /// # Returns
+    /// Always returns Ok (never fails since it's just a queue push)
     pub async fn append(&self, entry: WalEntry) -> Result<(), WalError> {
         self.pending.push(entry);
         // Notify flusher that work is available
@@ -125,7 +148,24 @@ impl WalStorage {
         Ok(())
     }
 
-    /// Start background flusher task
+    /// Starts the background flusher task.
+    ///
+    /// The flusher runs on a configurable interval and:
+    /// 1. Drains all pending entries from the queue
+    /// 2. Batches them into a single write operation
+    /// 3. Writes to disk with fsync for durability
+    ///
+    /// The flusher also responds to immediate flush requests via `flush_notify`.
+    /// On shutdown, performs a final flush before terminating.
+    ///
+    /// # Arguments
+    /// * `flush_interval_ms` - Milliseconds between flush attempts (e.g., 10ms)
+    ///
+    /// # Example
+    /// ```ignore
+    /// let wal = WalStorage::new("wal.log").await;
+    /// wal.start_flusher(10); // Flush every 10ms
+    /// ```
     pub fn start_flusher(&self, flush_interval_ms: u64) {
         let pending = Arc::clone(&self.pending);
         let inner = Arc::clone(&self.inner);
@@ -167,7 +207,22 @@ impl WalStorage {
         });
     }
 
-    /// Drain queue and write to disk (called by background task)
+    /// Drains the pending queue and writes all entries to disk.
+    ///
+    /// This is an internal method called by the background flusher. It:
+    /// 1. Drains all entries from the lock-free queue
+    /// 2. Serializes each entry with bincode
+    /// 3. Writes length-prefixed entries to disk
+    /// 4. Calls fsync to ensure durability
+    ///
+    /// Acquires the file lock only once for the entire batch, maximizing throughput.
+    ///
+    /// # Arguments
+    /// * `pending` - Lock-free queue of pending entries
+    /// * `inner` - Mutex-protected file writer
+    ///
+    /// # Errors
+    /// Returns error if serialization or I/O fails
     async fn drain_and_flush(
         pending: &SegQueue<WalEntry>,
         inner: &Arc<Mutex<InnerWal>>,
@@ -201,7 +256,18 @@ impl WalStorage {
         Ok(())
     }
 
-    /// Explicit flush - blocks until all pending entries are written
+    /// Performs an explicit flush, blocking until all pending entries are written.
+    ///
+    /// This method:
+    /// 1. Notifies the background flusher to flush immediately
+    /// 2. Polls the queue until it's empty (with timeout)
+    /// 3. Forces a final flush if entries remain after timeout
+    ///
+    /// Used by transactions during commit/abort to ensure durability before
+    /// returning to the caller.
+    ///
+    /// # Errors
+    /// Returns error if the flush operation fails
     pub async fn flush(&self) -> Result<(), WalError> {
         // Notify flusher to flush immediately
         self.flush_notify.notify_one();
@@ -221,7 +287,18 @@ impl WalStorage {
         Ok(())
     }
 
-    /// Stop the background flusher gracefully
+    /// Stops the background flusher gracefully.
+    ///
+    /// This method:
+    /// 1. Sets the shutdown flag atomically
+    /// 2. Notifies the flusher to wake up and check shutdown flag
+    /// 3. Waits for the flusher thread to complete (with final flush)
+    ///
+    /// Ensures all pending data is flushed before the thread terminates.
+    /// Should be called during database shutdown.
+    ///
+    /// # Errors
+    /// Returns error if the flusher thread panicked or join failed
     pub async fn stop_flusher(&self) -> Result<(), WalError> {
         self.shutdown.store(true, Ordering::SeqCst);
         self.flush_notify.notify_one();
@@ -237,6 +314,17 @@ impl WalStorage {
         Ok(())
     }
 
+    /// Writes a checkpoint marker to a separate file.
+    ///
+    /// The checkpoint file (WAL path + ".checkpoint") stores the highest
+    /// transaction ID that has been checkpointed. This allows recovery to
+    /// skip replaying old transactions.
+    ///
+    /// # Arguments
+    /// * `tx_id` - Transaction ID to checkpoint
+    ///
+    /// # Errors
+    /// Returns error if the checkpoint file cannot be written
     pub async fn set_checkpoint(&self, tx_id: u64) -> Result<(), WalError> {
         let ckpt_path = format!("{}.checkpoint", self.path);
         let mut ckpt_file = OpenOptions::new()
@@ -251,6 +339,16 @@ impl WalStorage {
         Ok(())
     }
 
+    /// Reads the last checkpoint transaction ID from disk.
+    ///
+    /// Returns 0 if no checkpoint file exists (indicating this is the first
+    /// checkpoint or the file was deleted).
+    ///
+    /// # Returns
+    /// The transaction ID of the last checkpoint, or 0 if none exists
+    ///
+    /// # Errors
+    /// Returns error if the checkpoint file exists but cannot be read or parsed
     pub async fn get_last_checkpoint(&self) -> Result<u64, WalError> {
         let ckpt_path = format!("{}.checkpoint", self.path);
         if !Path::new(&ckpt_path).exists() {
@@ -264,6 +362,20 @@ impl WalStorage {
             .map_err(|e| WalError::Checkpoint(format!("Invalid checkpoint TxID: {}", e)))
     }
 
+    /// Truncates the WAL by renaming the old file and creating a new one.
+    ///
+    /// This method:
+    /// 1. Flushes all pending entries to ensure nothing is lost
+    /// 2. Renames the current WAL to ".old" (for backup/debugging)
+    /// 3. Creates a new empty WAL at the specified path
+    ///
+    /// Should be called after a successful checkpoint to reclaim disk space.
+    ///
+    /// # Arguments
+    /// * `path` - Path for the new WAL file
+    ///
+    /// # Errors
+    /// Returns error if flush or file operations fail
     pub async fn truncate_wal(&mut self, path: &str) -> Result<(), WalError> {
         // Ensure all pending writes are flushed first
         self.flush().await?;

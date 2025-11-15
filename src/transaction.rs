@@ -13,6 +13,11 @@ pub struct Transaction {
 pub enum TxState { Active, Committed, Aborted }
 
 impl Transaction {
+    /// Creates a new transaction with a unique ID.
+    ///
+    /// The transaction ID is atomically incremented from a global counter,
+    /// ensuring uniqueness across all transactions (even after recovery).
+    /// The initial state is `TxState::Active`.
     pub fn new() -> Self {
         Self {
             id: NEXT_TX_ID.fetch_add(1, Ordering::SeqCst),
@@ -21,10 +26,29 @@ impl Transaction {
         }
     }
 
+    /// Adds a WAL entry to the transaction's local buffer.
+    ///
+    /// This does not write to the WAL immediately - entries are buffered
+    /// in memory until commit or abort is called.
     pub fn add_entry(&mut self, entry: WalEntry) {
         self.entries.push(entry);
     }
 
+    /// Appends an operation to both the transaction buffer and the WAL.
+    ///
+    /// This method:
+    /// 1. Sets the transaction ID and timestamp on the operation
+    /// 2. Adds the operation to the local transaction buffer
+    /// 3. Immediately appends to the WAL (lock-free via SegQueue)
+    ///
+    /// The operation is not applied to the store until `commit()` is called.
+    ///
+    /// # Arguments
+    /// * `db` - Database reference for WAL access
+    /// * `op` - Operation to append (Insert, Update, or Delete)
+    ///
+    /// # Errors
+    /// Returns error if the operation is not Insert/Update/Delete or if WAL append fails.
     pub async fn append_op(&mut self, db: &Arc<Database>, mut op: WalEntry) -> Result<(), WalError> {
         match &mut op {
             WalEntry::Insert { tx_id, timestamp, .. } => {
@@ -45,6 +69,19 @@ impl Transaction {
         db.wal.append(op).await
     }
 
+    /// Applies a single operation to the in-memory store.
+    ///
+    /// This method acquires a write lock on the HashMap and applies the operation:
+    /// - Insert: Adds key-value pair
+    /// - Update: Modifies existing value (fails if key doesn't exist)
+    /// - Delete: Removes key-value pair
+    ///
+    /// # Arguments
+    /// * `db` - Database reference for store access
+    /// * `op` - WAL entry to apply (must be Insert/Update/Delete)
+    ///
+    /// # Errors
+    /// Returns error if trying to update a non-existent key or if entry type is invalid.
     pub async fn apply_to_store(&self, db: &Arc<Database>, op: &WalEntry) -> Result<(), WalError> {
         let mut store = db.store.write().await;
         match op {
@@ -66,6 +103,21 @@ impl Transaction {
         Ok(())
     }
 
+    /// Commits the transaction, making all changes durable and visible.
+    ///
+    /// This method performs the following steps:
+    /// 1. Writes a Commit entry to the WAL
+    /// 2. Flushes the WAL to disk (fsync for durability)
+    /// 3. Applies all buffered operations to the in-memory store
+    /// 4. Marks transaction as Committed
+    ///
+    /// After commit, changes are durable (survive crashes) and visible to other transactions.
+    ///
+    /// # Arguments
+    /// * `db` - Database reference
+    ///
+    /// # Errors
+    /// Returns error if transaction is not Active or if any operation fails.
     pub async fn commit(mut self, db: &Arc<Database>) -> Result<(), WalError> {
         if self.state != TxState::Active {
             return Err(WalError::InvalidState("Cannot commit non-active transaction".to_string()));
@@ -85,6 +137,21 @@ impl Transaction {
         Ok(())
     }
 
+    /// Aborts the transaction, discarding all changes.
+    ///
+    /// This method:
+    /// 1. Writes an Abort entry to the WAL
+    /// 2. Flushes the WAL to disk
+    /// 3. Clears all buffered operations (changes are not applied to store)
+    /// 4. Marks transaction as Aborted
+    ///
+    /// After abort, no changes are visible and the transaction is rolled back.
+    ///
+    /// # Arguments
+    /// * `db` - Database reference
+    ///
+    /// # Errors
+    /// Returns error if transaction is not Active or if WAL operations fail.
     pub async fn abort(mut self, db: &Arc<Database>) -> Result<(), WalError> {
         if self.state != TxState::Active {
             return Err(WalError::InvalidState("Cannot abort non-active transaction".to_string()));
