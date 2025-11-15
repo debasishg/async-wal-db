@@ -2,3 +2,4 @@ Cargo.lock
 target/
 *.log
 *.log.checkpoint
+*.rs.backup

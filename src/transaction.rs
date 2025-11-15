@@ -42,7 +42,7 @@ impl Transaction {
             _ => return Err(WalError::InvalidState("Cannot append non-operation entry".to_string())),
         }
         self.add_entry(op.clone());
-        db.wal.append(&op).await
+        db.wal.append(op).await
     }
 
     pub async fn apply_to_store(&self, db: &Arc<Database>, op: &WalEntry) -> Result<(), WalError> {
@@ -75,7 +75,7 @@ impl Transaction {
             tx_id: self.id, 
             timestamp: WalEntry::new_timestamp() 
         };
-        db.wal.append(&commit_entry).await?;
+        db.wal.append(commit_entry).await?;
         db.wal.flush().await?;
 
         self.state = TxState::Committed;
@@ -94,7 +94,7 @@ impl Transaction {
             tx_id: self.id, 
             timestamp: WalEntry::new_timestamp() 
         };
-        db.wal.append(&abort_entry).await?;
+        db.wal.append(abort_entry).await?;
         db.wal.flush().await?;
         self.state = TxState::Aborted;
         self.entries.clear();

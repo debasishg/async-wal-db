@@ -15,6 +15,8 @@ pub struct Database {
 impl Database {
     pub async fn new(wal_path: &str) -> Arc<Self> {
         let wal = WalStorage::new(wal_path).await;
+        // Start background flusher with 10ms interval
+        wal.start_flusher(10);
         Arc::new(Self {
             store: Arc::new(RwLock::new(HashMap::new())),
             wal,
@@ -181,6 +183,11 @@ impl Database {
                 }
             }
         })
+    }
+
+    /// Graceful shutdown - flushes pending WAL entries
+    pub async fn shutdown(&self) -> Result<(), WalError> {
+        self.wal.stop_flusher().await
     }
 }
 
