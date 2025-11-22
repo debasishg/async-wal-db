@@ -36,6 +36,8 @@ pub enum WalError {
     ApplyStore(String),
     #[error("Checksum mismatch: expected {expected:#x}, got {actual:#x}")]
     ChecksumMismatch { expected: u32, actual: u32 },
+    #[error("Partial write detected at offset {offset}, truncating WAL tail")]
+    PartialWrite { offset: u64 },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -70,6 +72,34 @@ pub enum WalEntry {
 }
 
 pub(crate) static NEXT_TX_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Recovery action taken for a transaction during crash recovery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecoveryAction {
+    /// Transaction was committed successfully
+    Commit,
+    /// Transaction was explicitly aborted
+    Rollback,
+    /// Transaction was incomplete (no Commit/Abort marker)
+    Incomplete,
+}
+
+/// Statistics collected during recovery process.
+#[derive(Debug, Default, Clone)]
+pub struct RecoveryStats {
+    /// Total transactions found in WAL
+    pub total_transactions: usize,
+    /// Transactions that were committed
+    pub committed: usize,
+    /// Transactions that were aborted
+    pub aborted: usize,
+    /// Incomplete transactions (missing Commit/Abort)
+    pub incomplete: usize,
+    /// Partial writes detected and truncated
+    pub partial_writes: usize,
+    /// Checksum validation failures
+    pub checksum_failures: usize,
+}
 
 /// WAL entry header containing metadata for integrity checking.
 /// 

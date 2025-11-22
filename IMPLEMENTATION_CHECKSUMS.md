@@ -151,6 +151,48 @@ test wal_storage::tests::test_header_encoding ... ok
 
 **Overall**: <1% performance impact, massive gain in reliability.
 
+### Benchmark Results (with checksums enabled)
+
+**Scaling Benchmark** (`cargo run --release --example scaling_benchmark`):
+```
+| Threads | Total Txns | Time (s) | Throughput (txn/s) | Speedup | Latency (ms) |
+|---------|------------|----------|--------------------|---------| -------------|
+|       1 |        100 |     0.47 |             214.78 |   1.00x |        4.656 |
+|       2 |        200 |     0.79 |             253.68 |   1.18x |        3.942 |
+|       4 |        400 |     1.43 |             280.66 |   1.31x |        3.563 |
+|       8 |        800 |     2.56 |             312.73 |   1.46x |        3.198 |
+|      16 |       1600 |     4.36 |             367.24 |   1.71x |        2.723 |
+|      32 |       3200 |     6.07 |             526.95 |   2.45x |        1.898 |
+|      64 |       6400 |     6.16 |            1038.32 |   4.83x |        0.963 |
+|     128 |      12800 |     6.54 |            1957.72 |   9.11x |        0.511 |
+```
+
+**Peak Performance**: 1,957 txn/s at 128 threads (9.11x speedup vs single-threaded)
+
+**Batch Size Impact** (10 threads):
+```
+| Ops/Txn | Total Ops | Ops Throughput | Txn Latency (ms) |
+|---------|-----------|----------------|------------------|
+|       1 |       500 |         301.62 |            3.315 |
+|       5 |      2500 |        2157.91 |            2.317 |
+|      10 |      5000 |        8245.87 |            1.213 |
+|      20 |     10000 |       30640.58 |            0.653 |
+|      50 |     25000 |       81513.58 |            0.613 |
+```
+
+**Contention Test**:
+- Non-overlapping keys: 393.43 txn/s
+- Overlapping keys: 401.94 txn/s
+- Impact: -2.16% (negligible, within noise margin)
+
+**Standard Benchmark** (`cargo run --release --example benchmark`):
+- Single-threaded: 213.81 txn/s, 4.68 ms latency
+- 10 threads: 290.86 txn/s, 3.44 ms latency
+- 50 threads: 725.31 txn/s, 1.38 ms latency
+- Batch writes (10 ops/txn): 2,139 ops/s
+
+**Conclusion**: Checksum overhead is negligible (<1% impact). The CRC32 computation using `crc32fast` is highly optimized (SIMD instructions) and adds minimal latency compared to serialization and I/O costs.
+
 ## Benefits Achieved
 
 1. ✅ **Corruption Detection**: Detects bit flips, disk errors, partial writes

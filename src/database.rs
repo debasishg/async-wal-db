@@ -1,4 +1,4 @@
-use crate::{Transaction, WalEntry, WalError, WalStorage, WalEntryHeader, NEXT_TX_ID};
+use crate::{Transaction, WalEntry, WalError, WalStorage, WalEntryHeader, NEXT_TX_ID, RecoveryAction, RecoveryStats};
 use std::collections::HashMap;
 use std::io;
 use std::sync::Arc;
@@ -70,21 +70,50 @@ impl Database {
     /// # Errors
     /// Returns error if WAL cannot be opened, entries cannot be deserialized,
     /// or validation fails (e.g., empty keys).
-    pub async fn recover(&self) -> Result<(), WalError> {
+    pub async fn recover(&self) -> Result<RecoveryStats, WalError> {
+        let stats = self.recover_with_validation().await?;
+        Ok(stats)
+    }
+
+    /// Enhanced recovery with crash validation and statistics.
+    /// 
+    /// Handles:
+    /// - Incomplete transactions (missing Commit/Abort markers)
+    /// - Partial writes at WAL tail (torn pages)
+    /// - Checksum validation failures
+    /// - Transaction ordering and consistency
+    ///
+    /// # Errors
+    /// Returns error if WAL cannot be opened or critical validation fails.
+    async fn recover_with_validation(&self) -> Result<RecoveryStats, WalError> {
+        let mut stats = RecoveryStats::default();
         let mut file = File::open(&self.wal.path).await
             .map_err(|_| WalError::OpenWal)?;
         let mut reader = BufReader::new(&mut file);
 
         let mut tx_entries: HashMap<u64, Vec<WalEntry>> = HashMap::new();
-        let mut committed_txs: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        let mut tx_actions: HashMap<u64, RecoveryAction> = HashMap::new();
         let mut buffer = Vec::new();
+        let mut byte_offset = 0u64;
 
+        // Phase 1: Read and validate all WAL entries
         loop {
+            let entry_start_offset = byte_offset;
+            
             // Read header
             let mut header_bytes = [0u8; WalEntryHeader::SIZE];
             match reader.read_exact(&mut header_bytes).await {
-                Ok(_) => {}
-                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+                Ok(_) => {
+                    byte_offset += WalEntryHeader::SIZE as u64;
+                }
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                    // Partial header at end of file - this is a partial write
+                    if entry_start_offset > 0 {
+                        stats.partial_writes += 1;
+                        println!("⚠️  Partial write detected at offset {entry_start_offset}, truncating WAL tail");
+                    }
+                    break;
+                }
                 Err(e) => return Err(WalError::from(e)),
             }
             
@@ -94,13 +123,36 @@ impl Database {
             #[allow(clippy::cast_possible_truncation)]
             let len = header.length as usize;
             buffer.resize(len, 0);
-            reader.read_exact(&mut buffer).await?;
+            
+            match reader.read_exact(&mut buffer).await {
+                Ok(_) => {
+                    byte_offset += len as u64;
+                }
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                    // Partial data at end of file - torn page
+                    stats.partial_writes += 1;
+                    println!("⚠️  Torn page detected at offset {entry_start_offset}, truncating WAL tail");
+                    break;
+                }
+                Err(e) => return Err(WalError::from(e)),
+            }
             
             // Validate checksum
-            header.validate(&buffer)?;
+            if let Err(e) = header.validate(&buffer) {
+                stats.checksum_failures += 1;
+                println!("⚠️  Checksum failure at offset {entry_start_offset}: {e}");
+                // Stop processing at first checksum failure (likely corruption)
+                break;
+            }
 
-            let entry = bincode::deserialize::<WalEntry>(&buffer)
-                .map_err(WalError::Deserialization)?;
+            let entry = match bincode::deserialize::<WalEntry>(&buffer) {
+                Ok(e) => e,
+                Err(e) => {
+                    println!("⚠️  Deserialization error at offset {entry_start_offset}: {e}");
+                    stats.partial_writes += 1;
+                    break;
+                }
+            };
 
             let tx_id = match &entry {
                 WalEntry::Commit { tx_id, .. }
@@ -109,45 +161,91 @@ impl Database {
                 | WalEntry::Update { tx_id, .. }
                 | WalEntry::Delete { tx_id, .. } => *tx_id,
             };
+            
             tx_entries.entry(tx_id).or_default().push(entry.clone());
 
+            // Track transaction completion status
             match entry {
-                WalEntry::Commit { tx_id, .. } => { committed_txs.insert(tx_id); }
-                WalEntry::Abort { tx_id, .. } => { committed_txs.remove(&tx_id); }
-                _ => {}
+                WalEntry::Commit { tx_id, .. } => {
+                    tx_actions.insert(tx_id, RecoveryAction::Commit);
+                }
+                WalEntry::Abort { tx_id, .. } => {
+                    tx_actions.insert(tx_id, RecoveryAction::Rollback);
+                }
+                _ => {
+                    // Mark as incomplete unless we see Commit/Abort later
+                    tx_actions.entry(tx_id).or_insert(RecoveryAction::Incomplete);
+                }
             }
         }
 
-        let mut store = self.store.write().await;
-        let mut sorted_tx_ids: Vec<u64> = committed_txs.iter().copied().collect();
-        sorted_tx_ids.sort_unstable();
+        // Phase 2: Classify transactions
+        stats.total_transactions = tx_entries.len();
+        for (tx_id, action) in &tx_actions {
+            match action {
+                RecoveryAction::Commit => stats.committed += 1,
+                RecoveryAction::Rollback => stats.aborted += 1,
+                RecoveryAction::Incomplete => {
+                    stats.incomplete += 1;
+                    println!("⚠️  Incomplete transaction {tx_id} (missing Commit/Abort) - will be rolled back");
+                }
+            }
+        }
 
-        for tx_id in sorted_tx_ids {
-            if let Some(entries) = tx_entries.get(&tx_id) {
+        // Phase 3: Apply only committed transactions in order
+        let mut store = self.store.write().await;
+        let mut committed_tx_ids: Vec<u64> = tx_actions
+            .iter()
+            .filter(|(_, action)| **action == RecoveryAction::Commit)
+            .map(|(tx_id, _)| *tx_id)
+            .collect();
+        committed_tx_ids.sort_unstable();
+
+        for tx_id in &committed_tx_ids {
+            if let Some(entries) = tx_entries.get(tx_id) {
                 for entry in entries.iter().filter(|e| !matches!(e, WalEntry::Commit { .. } | WalEntry::Abort { .. })) {
                     match entry {
-                        WalEntry::Insert { key, value, .. } => { store.insert(key.clone(), value.clone()); }
-                        WalEntry::Update { key, new_value, .. } => { store.insert(key.clone(), new_value.clone()); }
-                        WalEntry::Delete { key, .. } => { store.remove(key); }
+                        WalEntry::Insert { key, value, .. } => {
+                            store.insert(key.clone(), value.clone());
+                        }
+                        WalEntry::Update { key, new_value, .. } => {
+                            store.insert(key.clone(), new_value.clone());
+                        }
+                        WalEntry::Delete { key, .. } => {
+                            store.remove(key);
+                        }
                         _ => {}
                     }
                 }
             }
         }
 
+        // Phase 4: Validate recovered state
         for key in (*store).keys() {
             if key.is_empty() {
                 return Err(WalError::Validation("Invalid empty key after recovery".to_string()));
             }
         }
 
-        // Restore transaction ID counter to avoid ID reuse after restart
+        // Phase 5: Restore transaction ID counter to avoid ID reuse
         if let Some(&max_tx_id) = tx_entries.keys().max() {
             NEXT_TX_ID.fetch_max(max_tx_id + 1, Ordering::SeqCst);
         }
 
-        println!("Recovery complete: {} committed txns replayed", committed_txs.len());
-        Ok(())
+        // Print recovery summary
+        println!("✅ Recovery complete:");
+        println!("   Total transactions: {}", stats.total_transactions);
+        println!("   Committed: {}", stats.committed);
+        println!("   Aborted: {}", stats.aborted);
+        println!("   Incomplete (rolled back): {}", stats.incomplete);
+        if stats.partial_writes > 0 {
+            println!("   Partial writes truncated: {}", stats.partial_writes);
+        }
+        if stats.checksum_failures > 0 {
+            println!("   Checksum failures: {}", stats.checksum_failures);
+        }
+
+        Ok(stats)
     }
 
     /// Creates a checkpoint by compacting the WAL and advancing the checkpoint marker.
@@ -363,5 +461,207 @@ mod tests {
         db2.recover().await.unwrap();
         let tx2 = db2.begin_transaction();
         assert!(tx2.id > tx1_id, "Transaction ID after recovery ({}) should be greater than before ({})", tx2.id, tx1_id);
+    }
+
+    #[async_test]
+    async fn test_incomplete_transaction_recovery() {
+        let temp_dir = TempDir::new().unwrap();
+        let wal_path = temp_dir.path().join("wal_incomplete.log").to_str().unwrap().to_string();
+        
+        let db = Database::new(&wal_path).await;
+        
+        // Create a complete transaction
+        let mut tx1 = db.begin_transaction();
+        tx1.append_op(&db, WalEntry::Insert {
+            tx_id: 0, timestamp: 0, key: "complete".to_string(), value: b"data1".to_vec()
+        }).await.unwrap();
+        tx1.commit(&db).await.unwrap();
+        
+        // Create an incomplete transaction (no commit/abort)
+        let mut tx2 = db.begin_transaction();
+        tx2.append_op(&db, WalEntry::Insert {
+            tx_id: 0, timestamp: 0, key: "incomplete".to_string(), value: b"data2".to_vec()
+        }).await.unwrap();
+        // Simulate crash - don't commit, just drop
+        drop(tx2);
+        
+        // Force flush to ensure entries are on disk
+        db.wal.flush().await.unwrap();
+        drop(db);
+
+        // Recover - incomplete transaction should be rolled back
+        let db2 = Database::new(&wal_path).await;
+        let stats = db2.recover().await.unwrap();
+        
+        assert_eq!(stats.total_transactions, 2);
+        assert_eq!(stats.committed, 1);
+        assert_eq!(stats.incomplete, 1);
+        
+        let store = db2.store.read().await;
+        assert_eq!(store.get("complete").map(|v| v.as_slice()), Some(&b"data1"[..]));
+        assert!(store.get("incomplete").is_none(), "Incomplete transaction should be rolled back");
+    }
+
+    #[async_test]
+    async fn test_aborted_transaction_recovery() {
+        let temp_dir = TempDir::new().unwrap();
+        let wal_path = temp_dir.path().join("wal_aborted.log").to_str().unwrap().to_string();
+        
+        let db = Database::new(&wal_path).await;
+        
+        // Create and abort a transaction
+        let mut tx = db.begin_transaction();
+        tx.append_op(&db, WalEntry::Insert {
+            tx_id: 0, timestamp: 0, key: "aborted".to_string(), value: b"data".to_vec()
+        }).await.unwrap();
+        tx.abort(&db).await.unwrap();
+        
+        db.wal.flush().await.unwrap();
+        drop(db);
+
+        // Recover - aborted transaction should not appear in store
+        let db2 = Database::new(&wal_path).await;
+        let stats = db2.recover().await.unwrap();
+        
+        assert_eq!(stats.total_transactions, 1);
+        assert_eq!(stats.aborted, 1);
+        assert_eq!(stats.committed, 0);
+        
+        let store = db2.store.read().await;
+        assert!(store.get("aborted").is_none(), "Aborted transaction should not be in store");
+    }
+
+    #[async_test]
+    async fn test_partial_write_recovery() {
+        let temp_dir = TempDir::new().unwrap();
+        let wal_path = temp_dir.path().join("wal_partial.log").to_str().unwrap().to_string();
+        
+        let db = Database::new(&wal_path).await;
+        
+        // Create a complete transaction
+        let mut tx1 = db.begin_transaction();
+        tx1.append_op(&db, WalEntry::Insert {
+            tx_id: 0, timestamp: 0, key: "before_crash".to_string(), value: b"data".to_vec()
+        }).await.unwrap();
+        tx1.commit(&db).await.unwrap();
+        db.wal.flush().await.unwrap();
+        drop(db);
+
+        // Simulate partial write by truncating the WAL file in the middle
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&wal_path)
+            .unwrap();
+        use std::io::Write;
+        // Write incomplete header (only 5 bytes instead of 13)
+        file.write_all(&[1, 2, 3, 4, 5]).unwrap();
+        drop(file);
+
+        // Recover - should handle partial write gracefully
+        let db2 = Database::new(&wal_path).await;
+        let stats = db2.recover().await.unwrap();
+        
+        assert_eq!(stats.partial_writes, 1, "Should detect partial write");
+        assert_eq!(stats.committed, 1);
+        
+        let store = db2.store.read().await;
+        assert_eq!(store.get("before_crash").map(|v| v.as_slice()), Some(&b"data"[..]));
+    }
+
+    #[async_test]
+    async fn test_mixed_transaction_states_recovery() {
+        let temp_dir = TempDir::new().unwrap();
+        let wal_path = temp_dir.path().join("wal_mixed.log").to_str().unwrap().to_string();
+        
+        let db = Database::new(&wal_path).await;
+        
+        // Transaction 1: Committed
+        let mut tx1 = db.begin_transaction();
+        tx1.append_op(&db, WalEntry::Insert {
+            tx_id: 0, timestamp: 0, key: "tx1".to_string(), value: b"committed".to_vec()
+        }).await.unwrap();
+        tx1.commit(&db).await.unwrap();
+        
+        // Transaction 2: Aborted
+        let mut tx2 = db.begin_transaction();
+        tx2.append_op(&db, WalEntry::Insert {
+            tx_id: 0, timestamp: 0, key: "tx2".to_string(), value: b"aborted".to_vec()
+        }).await.unwrap();
+        tx2.abort(&db).await.unwrap();
+        
+        // Transaction 3: Incomplete
+        let mut tx3 = db.begin_transaction();
+        tx3.append_op(&db, WalEntry::Insert {
+            tx_id: 0, timestamp: 0, key: "tx3".to_string(), value: b"incomplete".to_vec()
+        }).await.unwrap();
+        // Don't commit or abort
+        drop(tx3);
+        
+        // Transaction 4: Committed
+        let mut tx4 = db.begin_transaction();
+        tx4.append_op(&db, WalEntry::Insert {
+            tx_id: 0, timestamp: 0, key: "tx4".to_string(), value: b"committed2".to_vec()
+        }).await.unwrap();
+        tx4.commit(&db).await.unwrap();
+        
+        db.wal.flush().await.unwrap();
+        drop(db);
+
+        // Recover and verify
+        let db2 = Database::new(&wal_path).await;
+        let stats = db2.recover().await.unwrap();
+        
+        assert_eq!(stats.total_transactions, 4);
+        assert_eq!(stats.committed, 2);
+        assert_eq!(stats.aborted, 1);
+        assert_eq!(stats.incomplete, 1);
+        
+        let store = db2.store.read().await;
+        assert_eq!(store.get("tx1").map(|v| v.as_slice()), Some(&b"committed"[..]));
+        assert!(store.get("tx2").is_none(), "Aborted tx should not be in store");
+        assert!(store.get("tx3").is_none(), "Incomplete tx should not be in store");
+        assert_eq!(store.get("tx4").map(|v| v.as_slice()), Some(&b"committed2"[..]));
+    }
+
+    #[async_test]
+    async fn test_recovery_with_updates_and_deletes() {
+        let temp_dir = TempDir::new().unwrap();
+        let wal_path = temp_dir.path().join("wal_ops.log").to_str().unwrap().to_string();
+        
+        let db = Database::new(&wal_path).await;
+        
+        // Insert
+        let mut tx1 = db.begin_transaction();
+        tx1.append_op(&db, WalEntry::Insert {
+            tx_id: 0, timestamp: 0, key: "key1".to_string(), value: b"value1".to_vec()
+        }).await.unwrap();
+        tx1.commit(&db).await.unwrap();
+        
+        // Update
+        let mut tx2 = db.begin_transaction();
+        tx2.append_op(&db, WalEntry::Update {
+            tx_id: 0, timestamp: 0, key: "key1".to_string(), 
+            old_value: b"value1".to_vec(), new_value: b"value2".to_vec()
+        }).await.unwrap();
+        tx2.commit(&db).await.unwrap();
+        
+        // Delete
+        let mut tx3 = db.begin_transaction();
+        tx3.append_op(&db, WalEntry::Delete {
+            tx_id: 0, timestamp: 0, key: "key1".to_string(), old_value: b"value2".to_vec()
+        }).await.unwrap();
+        tx3.commit(&db).await.unwrap();
+        
+        db.wal.flush().await.unwrap();
+        drop(db);
+
+        // Recover and verify final state
+        let db2 = Database::new(&wal_path).await;
+        let stats = db2.recover().await.unwrap();
+        
+        assert_eq!(stats.committed, 3);
+        
+        let store = db2.store.read().await;
+        assert!(store.get("key1").is_none(), "Key should be deleted");
     }
 }
