@@ -34,6 +34,8 @@ pub enum WalError {
     InvalidState(String),
     #[error("Apply to store failed: {0}")]
     ApplyStore(String),
+    #[error("Checksum mismatch: expected {expected:#x}, got {actual:#x}")]
+    ChecksumMismatch { expected: u32, actual: u32 },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -69,6 +71,69 @@ pub enum WalEntry {
 
 pub(crate) static NEXT_TX_ID: AtomicU64 = AtomicU64::new(1);
 
+/// WAL entry header containing metadata for integrity checking.
+/// 
+/// Format on disk:
+/// ```text
+/// [length: u64][checksum: u32][version: u8][entry_data: bytes]
+/// ```
+#[derive(Debug, Clone, Copy)]
+pub struct WalEntryHeader {
+    /// Length of the serialized entry data (not including header)
+    pub length: u64,
+    /// CRC32 checksum of the serialized entry data
+    pub checksum: u32,
+    /// Format version (currently always 1)
+    pub version: u8,
+}
+
+impl WalEntryHeader {
+    /// Current WAL format version
+    pub const VERSION: u8 = 1;
+    
+    /// Size of header in bytes (8 + 4 + 1 = 13)
+    pub const SIZE: usize = 13;
+    
+    /// Creates a new header for the given serialized entry data.
+    pub fn new(data: &[u8]) -> Self {
+        let checksum = crc32fast::hash(data);
+        Self {
+            length: data.len() as u64,
+            checksum,
+            version: Self::VERSION,
+        }
+    }
+    
+    /// Serializes the header to bytes.
+    pub fn to_bytes(&self) -> [u8; Self::SIZE] {
+        let mut bytes = [0u8; Self::SIZE];
+        bytes[0..8].copy_from_slice(&self.length.to_le_bytes());
+        bytes[8..12].copy_from_slice(&self.checksum.to_le_bytes());
+        bytes[12] = self.version;
+        bytes
+    }
+    
+    /// Deserializes a header from bytes.
+    pub fn from_bytes(bytes: &[u8; Self::SIZE]) -> Self {
+        let length = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
+        let checksum = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
+        let version = bytes[12];
+        Self { length, checksum, version }
+    }
+    
+    /// Validates that the data matches the header's checksum.
+    pub fn validate(&self, data: &[u8]) -> Result<(), WalError> {
+        let actual_checksum = crc32fast::hash(data);
+        if actual_checksum != self.checksum {
+            return Err(WalError::ChecksumMismatch {
+                expected: self.checksum,
+                actual: actual_checksum,
+            });
+        }
+        Ok(())
+    }
+}
+
 impl WalEntry {
     pub fn new_timestamp() -> u64 {
         std::time::SystemTime::now()
@@ -86,7 +151,7 @@ mod tests {
     fn test_wal_entry_serialization() {
         let entry = WalEntry::Insert {
             tx_id: 1,
-            timestamp: 123456,
+            timestamp: 123_456,
             key: "test_key".to_string(),
             value: b"test_value".to_vec(),
         };

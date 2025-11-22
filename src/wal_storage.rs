@@ -1,4 +1,4 @@
-use crate::{WalEntry, WalError};
+use crate::{WalEntry, WalError, WalEntryHeader};
 use crossbeam::queue::SegQueue;
 use std::path::Path;
 use std::sync::Arc;
@@ -31,7 +31,7 @@ use tokio::test as async_test;
 ///                                    (Mutex only here)
 /// ```
 ///
-/// ## Lock-Free Concurrency with SegQueue
+/// ## Lock-Free Concurrency with `SegQueue`
 ///
 /// The `SegQueue` from crossbeam provides lock-free concurrent access using
 /// Compare-And-Swap (CAS) atomic operations:
@@ -87,7 +87,7 @@ pub struct WalStorage {
     flusher_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
     /// Atomic shutdown flag - when set to true, signals the background flusher to terminate
     shutdown: Arc<AtomicBool>,
-    /// Notify mechanism for immediate flush requests - allows explicit flush() calls
+    /// Notify mechanism for immediate flush requests - allows explicit `flush()` calls
     /// to wake the background flusher without waiting for the next interval tick
     flush_notify: Arc<Notify>,
 }
@@ -141,6 +141,7 @@ impl WalStorage {
     ///
     /// # Returns
     /// Always returns Ok (never fails since it's just a queue push)
+    #[allow(clippy::unused_async)]
     pub async fn append(&self, entry: WalEntry) -> Result<(), WalError> {
         self.pending.push(entry);
         // Notify flusher that work is available
@@ -179,13 +180,13 @@ impl WalStorage {
                 tokio::select! {
                     _ = interval.tick() => {
                         if let Err(e) = Self::drain_and_flush(&pending, &inner).await {
-                            eprintln!("WAL flush error: {}", e);
+                            eprintln!("WAL flush error: {e}");
                         }
                     }
-                    _ = flush_notify.notified() => {
+                    () = flush_notify.notified() => {
                         // Immediate flush requested
                         if let Err(e) = Self::drain_and_flush(&pending, &inner).await {
-                            eprintln!("WAL flush error: {}", e);
+                            eprintln!("WAL flush error: {e}");
                         }
                     }
                 }
@@ -193,7 +194,7 @@ impl WalStorage {
                 if shutdown.load(Ordering::SeqCst) {
                     // Final flush on shutdown
                     if let Err(e) = Self::drain_and_flush(&pending, &inner).await {
-                        eprintln!("Final WAL flush error: {}", e);
+                        eprintln!("Final WAL flush error: {e}");
                     }
                     break;
                 }
@@ -244,9 +245,13 @@ impl WalStorage {
         for entry in batch {
             let encoded = bincode::serialize(&entry)
                 .map_err(WalError::Deserialization)?;
-            let len = (encoded.len() as u64).to_le_bytes();
+            
+            // Create header with CRC32 checksum
+            let header = WalEntryHeader::new(&encoded);
+            let header_bytes = header.to_bytes();
 
-            inner.file.write_all(&len).await?;
+            // Write header then data
+            inner.file.write_all(&header_bytes).await?;
             inner.file.write_all(&encoded).await?;
         }
 
@@ -305,9 +310,8 @@ impl WalStorage {
 
         // Wait for flusher to finish
         if let Some(handle) = self.flusher_handle.lock().await.take() {
-            handle.await.map_err(|e| WalError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("Flusher join error: {}", e)
+            handle.await.map_err(|e| WalError::Io(std::io::Error::other(
+                format!("Flusher join error: {e}")
             )))?;
         }
 
@@ -333,7 +337,7 @@ impl WalStorage {
             .truncate(true)
             .open(ckpt_path)
             .await
-            .map_err(|e| WalError::Checkpoint(format!("Failed to write checkpoint: {}", e)))?;
+            .map_err(|e| WalError::Checkpoint(format!("Failed to write checkpoint: {e}")))?;
         ckpt_file.write_all(tx_id.to_string().as_bytes()).await?;
         ckpt_file.flush().await?;
         Ok(())
@@ -355,11 +359,11 @@ impl WalStorage {
             return Ok(0);
         }
         let mut ckpt_file = File::open(ckpt_path).await
-            .map_err(|e| WalError::Checkpoint(format!("Failed to read checkpoint: {}", e)))?;
+            .map_err(|e| WalError::Checkpoint(format!("Failed to read checkpoint: {e}")))?;
         let mut contents = String::new();
         ckpt_file.read_to_string(&mut contents).await?;
         contents.trim().parse::<u64>()
-            .map_err(|e| WalError::Checkpoint(format!("Invalid checkpoint TxID: {}", e)))
+            .map_err(|e| WalError::Checkpoint(format!("Invalid checkpoint TxID: {e}")))
     }
 
     /// Truncates the WAL by renaming the old file and creating a new one.
@@ -382,7 +386,7 @@ impl WalStorage {
         
         let old_path = format!("{}.old", self.path);
         tokio::fs::rename(&self.path, &old_path).await
-            .map_err(|e| WalError::Checkpoint(format!("Failed to rename WAL: {}", e)))?;
+            .map_err(|e| WalError::Checkpoint(format!("Failed to rename WAL: {e}")))?;
         *self = Self::new(path).await;
         Ok(())
     }
@@ -449,10 +453,94 @@ mod tests {
         // Ensure everything is flushed
         wal.flush().await.unwrap();
         
+        // Give a small grace period for filesystem sync
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+        
         // Verify file has data
         let file_size = tokio::fs::metadata(&wal_path).await.unwrap().len();
         assert!(file_size > 0, "WAL file should contain data from 1000 entries");
 
         wal.stop_flusher().await.unwrap();
+    }
+
+    #[async_test]
+    async fn test_checksum_validation() {
+        use tokio::io::{AsyncWriteExt, AsyncSeekExt};
+        
+        let temp_dir = TempDir::new().unwrap();
+        let wal_path = temp_dir.path().join("wal_checksum.log");
+        
+        // Write a valid entry first
+        let wal = WalStorage::new(&wal_path).await;
+        wal.start_flusher(10);
+        
+        let entry = WalEntry::Insert {
+            tx_id: 1,
+            timestamp: 123,
+            key: "test".to_string(),
+            value: b"data".to_vec(),
+        };
+        wal.append(entry).await.unwrap();
+        wal.flush().await.unwrap();
+        wal.stop_flusher().await.unwrap();
+        
+        // Now corrupt the file by modifying a byte
+        let mut file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .open(&wal_path)
+            .await
+            .unwrap();
+        
+        // Seek past the header and corrupt the data
+        file.seek(std::io::SeekFrom::Start(WalEntryHeader::SIZE as u64 + 5)).await.unwrap();
+        file.write_all(&[0xFF]).await.unwrap();
+        file.flush().await.unwrap();
+        drop(file);
+        
+        // Try to read - should fail with checksum error
+        use tokio::fs::File;
+        use tokio::io::BufReader;
+        
+        let mut file = File::open(&wal_path).await.unwrap();
+        let mut reader = BufReader::new(&mut file);
+        
+        let mut header_bytes = [0u8; WalEntryHeader::SIZE];
+        reader.read_exact(&mut header_bytes).await.unwrap();
+        let header = WalEntryHeader::from_bytes(&header_bytes);
+        
+        let mut buffer = vec![0u8; header.length as usize];
+        reader.read_exact(&mut buffer).await.unwrap();
+        
+        let result = header.validate(&buffer);
+        assert!(result.is_err(), "Should detect corruption");
+        
+        match result {
+            Err(WalError::ChecksumMismatch { .. }) => {
+                // Expected error type
+            }
+            _ => panic!("Expected ChecksumMismatch error"),
+        }
+    }
+
+    #[async_test]
+    async fn test_header_encoding() {
+        let data = b"test data for checksum";
+        let header = WalEntryHeader::new(data);
+        
+        // Verify header fields
+        assert_eq!(header.length, data.len() as u64);
+        assert_eq!(header.version, WalEntryHeader::VERSION);
+        assert_ne!(header.checksum, 0); // Should have calculated checksum
+        
+        // Verify validation works
+        assert!(header.validate(data).is_ok());
+        
+        // Verify round-trip encoding
+        let bytes = header.to_bytes();
+        let decoded = WalEntryHeader::from_bytes(&bytes);
+        
+        assert_eq!(header.length, decoded.length);
+        assert_eq!(header.checksum, decoded.checksum);
+        assert_eq!(header.version, decoded.version);
     }
 }

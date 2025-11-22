@@ -1,6 +1,6 @@
 use crate::WalError;
 use heed::{Database, Env, EnvOpenOptions};
-use heed::types::*;
+use heed::types::{Str, Bytes};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -12,7 +12,7 @@ pub struct LmdbStorage {
 
 impl LmdbStorage {
     pub fn new<P: AsRef<Path>>(path: P) -> Result<Self, WalError> {
-        std::fs::create_dir_all(&path).map_err(|e| WalError::Io(e))?;
+        std::fs::create_dir_all(&path).map_err(WalError::Io)?;
         
         // Create LMDB environment with 1GB max size
         let env = unsafe {
@@ -20,26 +20,22 @@ impl LmdbStorage {
                 .map_size(1024 * 1024 * 1024) // 1GB
                 .max_dbs(1)
                 .open(path)
-                .map_err(|e| WalError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("Failed to open LMDB: {}", e)
+                .map_err(|e| WalError::Io(std::io::Error::other(
+                    format!("Failed to open LMDB: {e}")
                 )))?
         };
 
         // Create/open the main database
-        let mut wtxn = env.write_txn().map_err(|e| WalError::Io(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("Failed to create write transaction: {}", e)
+        let mut wtxn = env.write_txn().map_err(|e| WalError::Io(std::io::Error::other(
+            format!("Failed to create write transaction: {e}")
         )))?;
         
-        let db = env.create_database(&mut wtxn, None).map_err(|e| WalError::Io(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("Failed to create database: {}", e)
+        let db = env.create_database(&mut wtxn, None).map_err(|e| WalError::Io(std::io::Error::other(
+            format!("Failed to create database: {e}")
         )))?;
         
-        wtxn.commit().map_err(|e| WalError::Io(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("Failed to commit initial transaction: {}", e)
+        wtxn.commit().map_err(|e| WalError::Io(std::io::Error::other(
+            format!("Failed to commit initial transaction: {e}")
         )))?;
 
         Ok(Self {
@@ -50,34 +46,29 @@ impl LmdbStorage {
 
     /// Get a value - zero-copy read via mmap
     pub fn get(&self, key: &str) -> Result<Option<Vec<u8>>, WalError> {
-        let rtxn = self.env.read_txn().map_err(|e| WalError::Io(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("Failed to create read transaction: {}", e)
+        let rtxn = self.env.read_txn().map_err(|e| WalError::Io(std::io::Error::other(
+            format!("Failed to create read transaction: {e}")
         )))?;
         
-        let result = self.db.get(&rtxn, key).map_err(|e| WalError::Io(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("Failed to get value: {}", e)
+        let result = self.db.get(&rtxn, key).map_err(|e| WalError::Io(std::io::Error::other(
+            format!("Failed to get value: {e}")
         )))?;
         
-        Ok(result.map(|bytes| bytes.to_vec()))
+        Ok(result.map(<[u8]>::to_vec))
     }
 
     /// Put a value
     pub fn put(&self, key: &str, value: &[u8]) -> Result<(), WalError> {
-        let mut wtxn = self.env.write_txn().map_err(|e| WalError::Io(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("Failed to create write transaction: {}", e)
+        let mut wtxn = self.env.write_txn().map_err(|e| WalError::Io(std::io::Error::other(
+            format!("Failed to create write transaction: {e}")
         )))?;
         
-        self.db.put(&mut wtxn, key, value).map_err(|e| WalError::Io(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("Failed to put value: {}", e)
+        self.db.put(&mut wtxn, key, value).map_err(|e| WalError::Io(std::io::Error::other(
+            format!("Failed to put value: {e}")
         )))?;
         
-        wtxn.commit().map_err(|e| WalError::Io(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("Failed to commit transaction: {}", e)
+        wtxn.commit().map_err(|e| WalError::Io(std::io::Error::other(
+            format!("Failed to commit transaction: {e}")
         )))?;
         
         Ok(())
@@ -85,19 +76,16 @@ impl LmdbStorage {
 
     /// Delete a key
     pub fn delete(&self, key: &str) -> Result<bool, WalError> {
-        let mut wtxn = self.env.write_txn().map_err(|e| WalError::Io(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("Failed to create write transaction: {}", e)
+        let mut wtxn = self.env.write_txn().map_err(|e| WalError::Io(std::io::Error::other(
+            format!("Failed to create write transaction: {e}")
         )))?;
         
-        let deleted = self.db.delete(&mut wtxn, key).map_err(|e| WalError::Io(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("Failed to delete key: {}", e)
+        let deleted = self.db.delete(&mut wtxn, key).map_err(|e| WalError::Io(std::io::Error::other(
+            format!("Failed to delete key: {e}")
         )))?;
         
-        wtxn.commit().map_err(|e| WalError::Io(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("Failed to commit transaction: {}", e)
+        wtxn.commit().map_err(|e| WalError::Io(std::io::Error::other(
+            format!("Failed to commit transaction: {e}")
         )))?;
         
         Ok(deleted)
@@ -108,16 +96,14 @@ impl LmdbStorage {
     where
         F: FnOnce(&mut heed::RwTxn, &Database<Str, Bytes>) -> Result<(), WalError>,
     {
-        let mut wtxn = self.env.write_txn().map_err(|e| WalError::Io(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("Failed to create write transaction: {}", e)
+        let mut wtxn = self.env.write_txn().map_err(|e| WalError::Io(std::io::Error::other(
+            format!("Failed to create write transaction: {e}")
         )))?;
         
         f(&mut wtxn, &self.db)?;
         
-        wtxn.commit().map_err(|e| WalError::Io(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("Failed to commit batch transaction: {}", e)
+        wtxn.commit().map_err(|e| WalError::Io(std::io::Error::other(
+            format!("Failed to commit batch transaction: {e}")
         )))?;
         
         Ok(())

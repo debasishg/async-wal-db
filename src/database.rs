@@ -1,4 +1,4 @@
-use crate::{Transaction, WalEntry, WalError, WalStorage, NEXT_TX_ID};
+use crate::{Transaction, WalEntry, WalError, WalStorage, WalEntryHeader, NEXT_TX_ID};
 use std::collections::HashMap;
 use std::io;
 use std::sync::Arc;
@@ -7,10 +7,10 @@ use tokio::fs::File;
 use tokio::io::{AsyncReadExt, BufReader};
 use tokio::sync::RwLock;
 
-/// Main database structure with lock-free WAL and in-memory HashMap storage.
+/// Main database structure with lock-free WAL and in-memory `HashMap` storage.
 ///
 /// The database consists of:
-/// - `store`: In-memory HashMap with RwLock for concurrent reads
+/// - `store`: In-memory `HashMap` with `RwLock` for concurrent reads
 /// - `wal`: Lock-free Write-Ahead Log for durability
 ///
 /// All writes go through the WAL first, then are applied to the store on commit.
@@ -25,7 +25,7 @@ impl Database {
     /// This method:
     /// 1. Initializes the WAL storage at the given path
     /// 2. Starts the background flusher with a 10ms interval
-    /// 3. Creates an empty in-memory HashMap store
+    /// 3. Creates an empty in-memory `HashMap` store
     ///
     /// The database is ready to accept transactions immediately after creation.
     /// To restore from existing WAL, call `recover()` after `new()`.
@@ -80,25 +80,36 @@ impl Database {
         let mut buffer = Vec::new();
 
         loop {
-            let mut len_bytes = [0u8; 8];
-            match reader.read_exact(&mut len_bytes).await {
+            // Read header
+            let mut header_bytes = [0u8; WalEntryHeader::SIZE];
+            match reader.read_exact(&mut header_bytes).await {
                 Ok(_) => {}
                 Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
                 Err(e) => return Err(WalError::from(e)),
             }
-            let len = u64::from_le_bytes(len_bytes) as usize;
-
+            
+            let header = WalEntryHeader::from_bytes(&header_bytes);
+            
+            // Read entry data
+            #[allow(clippy::cast_possible_truncation)]
+            let len = header.length as usize;
             buffer.resize(len, 0);
             reader.read_exact(&mut buffer).await?;
+            
+            // Validate checksum
+            header.validate(&buffer)?;
 
             let entry = bincode::deserialize::<WalEntry>(&buffer)
                 .map_err(WalError::Deserialization)?;
 
             let tx_id = match &entry {
-                WalEntry::Commit { tx_id, .. } | WalEntry::Abort { tx_id, .. } => *tx_id,
-                WalEntry::Insert { tx_id, .. } | WalEntry::Update { tx_id, .. } | WalEntry::Delete { tx_id, .. } => *tx_id,
+                WalEntry::Commit { tx_id, .. }
+                | WalEntry::Abort { tx_id, .. }
+                | WalEntry::Insert { tx_id, .. }
+                | WalEntry::Update { tx_id, .. }
+                | WalEntry::Delete { tx_id, .. } => *tx_id,
             };
-            tx_entries.entry(tx_id).or_insert_with(Vec::new).push(entry.clone());
+            tx_entries.entry(tx_id).or_default().push(entry.clone());
 
             match entry {
                 WalEntry::Commit { tx_id, .. } => { committed_txs.insert(tx_id); }
@@ -109,7 +120,7 @@ impl Database {
 
         let mut store = self.store.write().await;
         let mut sorted_tx_ids: Vec<u64> = committed_txs.iter().copied().collect();
-        sorted_tx_ids.sort();
+        sorted_tx_ids.sort_unstable();
 
         for tx_id in sorted_tx_ids {
             if let Some(entries) = tx_entries.get(&tx_id) {
@@ -124,7 +135,7 @@ impl Database {
             }
         }
 
-        for (key, _) in &*store {
+        for key in (*store).keys() {
             if key.is_empty() {
                 return Err(WalError::Validation("Invalid empty key after recovery".to_string()));
             }
@@ -170,28 +181,39 @@ impl Database {
         let mut buffer = Vec::new();
 
         loop {
-            let mut len_bytes = [0u8; 8];
-            match reader.read_exact(&mut len_bytes).await {
+            // Read header
+            let mut header_bytes = [0u8; WalEntryHeader::SIZE];
+            match reader.read_exact(&mut header_bytes).await {
                 Ok(_) => {}
                 Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
                 Err(e) => return Err(WalError::from(e)),
             }
-            let len = u64::from_le_bytes(len_bytes) as usize;
-
+            
+            let header = WalEntryHeader::from_bytes(&header_bytes);
+            
+            // Read entry data
+            #[allow(clippy::cast_possible_truncation)]
+            let len = header.length as usize;
             buffer.resize(len, 0);
             reader.read_exact(&mut buffer).await?;
+            
+            // Validate checksum
+            header.validate(&buffer)?;
 
             let entry = bincode::deserialize::<WalEntry>(&buffer)
                 .map_err(WalError::Deserialization)?;
 
             let tx_id = match &entry {
-                WalEntry::Commit { tx_id, .. } | WalEntry::Abort { tx_id, .. } => *tx_id,
-                WalEntry::Insert { tx_id, .. } | WalEntry::Update { tx_id, .. } | WalEntry::Delete { tx_id, .. } => *tx_id,
+                WalEntry::Commit { tx_id, .. }
+                | WalEntry::Abort { tx_id, .. }
+                | WalEntry::Insert { tx_id, .. }
+                | WalEntry::Update { tx_id, .. }
+                | WalEntry::Delete { tx_id, .. } => *tx_id,
             };
 
             if tx_id <= last_ckpt { continue; }
 
-            tx_entries.entry(tx_id).or_insert_with(Vec::new).push(entry.clone());
+            tx_entries.entry(tx_id).or_default().push(entry.clone());
 
             match entry {
                 WalEntry::Commit { tx_id, .. } => { committed_txs.insert(tx_id); }
@@ -206,7 +228,7 @@ impl Database {
 
         let mut store = self.store.write().await;
         let mut sorted_tx_ids: Vec<u64> = committed_txs.iter().copied().filter(|&id| id > last_ckpt).collect();
-        sorted_tx_ids.sort();
+        sorted_tx_ids.sort_unstable();
 
         for tx_id in sorted_tx_ids {
             if let Some(entries) = tx_entries.get(&tx_id) {
@@ -224,7 +246,7 @@ impl Database {
         let max_ckpt = *committed_txs.iter().max().unwrap_or(&last_ckpt);
         self.wal.set_checkpoint(max_ckpt).await?;
 
-        println!("Checkpoint complete: Advanced to TxID {}", max_ckpt);
+        println!("Checkpoint complete: Advanced to TxID {max_ckpt}");
         Ok(max_ckpt)
     }
 
@@ -238,7 +260,7 @@ impl Database {
     /// * `interval_secs` - Seconds between checkpoint attempts
     ///
     /// # Returns
-    /// JoinHandle for the background task (can be used to cancel/await)
+    /// `JoinHandle` for the background task (can be used to cancel/await)
     ///
     /// # Example
     /// ```ignore
@@ -252,11 +274,11 @@ impl Database {
             loop {
                 interval.tick().await;
                 match db_clone.checkpoint().await {
-                    Ok(tx_id) => println!("Auto-checkpoint completed at TxID: {}", tx_id),
+                    Ok(tx_id) => println!("Auto-checkpoint completed at TxID: {tx_id}"),
                     Err(WalError::NoNewCheckpoints) => {
                         // This is normal - no new transactions to checkpoint
                     }
-                    Err(e) => eprintln!("Checkpoint failed: {}", e),
+                    Err(e) => eprintln!("Checkpoint failed: {e}"),
                 }
             }
         })

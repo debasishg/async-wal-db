@@ -12,6 +12,12 @@ pub struct Transaction {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum TxState { Active, Committed, Aborted }
 
+impl Default for Transaction {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Transaction {
     /// Creates a new transaction with a unique ID.
     ///
@@ -39,7 +45,7 @@ impl Transaction {
     /// This method:
     /// 1. Sets the transaction ID and timestamp on the operation
     /// 2. Adds the operation to the local transaction buffer
-    /// 3. Immediately appends to the WAL (lock-free via SegQueue)
+    /// 3. Immediately appends to the WAL (lock-free via `SegQueue`)
     ///
     /// The operation is not applied to the store until `commit()` is called.
     ///
@@ -51,15 +57,9 @@ impl Transaction {
     /// Returns error if the operation is not Insert/Update/Delete or if WAL append fails.
     pub async fn append_op(&mut self, db: &Arc<Database>, mut op: WalEntry) -> Result<(), WalError> {
         match &mut op {
-            WalEntry::Insert { tx_id, timestamp, .. } => {
-                *tx_id = self.id;
-                *timestamp = WalEntry::new_timestamp();
-            }
-            WalEntry::Update { tx_id, timestamp, .. } => {
-                *tx_id = self.id;
-                *timestamp = WalEntry::new_timestamp();
-            }
-            WalEntry::Delete { tx_id, timestamp, .. } => {
+            WalEntry::Insert { tx_id, timestamp, .. }
+            | WalEntry::Update { tx_id, timestamp, .. }
+            | WalEntry::Delete { tx_id, timestamp, .. } => {
                 *tx_id = self.id;
                 *timestamp = WalEntry::new_timestamp();
             }
@@ -71,7 +71,7 @@ impl Transaction {
 
     /// Applies a single operation to the in-memory store.
     ///
-    /// This method acquires a write lock on the HashMap and applies the operation:
+    /// This method acquires a write lock on the `HashMap` and applies the operation:
     /// - Insert: Adds key-value pair
     /// - Update: Modifies existing value (fails if key doesn't exist)
     /// - Delete: Removes key-value pair
@@ -90,9 +90,9 @@ impl Transaction {
             }
             WalEntry::Update { key, new_value, .. } => {
                 if let Some(v) = store.get_mut(key) {
-                    *v = new_value.clone();
+                    v.clone_from(new_value);
                 } else {
-                    return Err(WalError::ApplyStore(format!("Update on non-existent key: {}", key)));
+                    return Err(WalError::ApplyStore(format!("Update on non-existent key: {key}")));
                 }
             }
             WalEntry::Delete { key, .. } => {
