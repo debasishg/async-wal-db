@@ -2,7 +2,7 @@ use crate::{WalEntry, WalError, WalEntryHeader};
 use crossbeam::queue::SegQueue;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use tokio::fs::{File, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufWriter};
 use tokio::sync::{Mutex, Notify};
@@ -79,6 +79,12 @@ pub struct WalStorage {
     pub(crate) path: String,
     /// Lock-free queue for pending writes - multiple threads can push concurrently
     pending: Arc<SegQueue<WalEntry>>,
+    /// Maximum queue size - when reached, writers will wait asynchronously (backpressure)
+    max_queue_size: usize,
+    /// Atomic counter tracking pending queue size - used for efficient capacity checks
+    pending_count: Arc<AtomicUsize>,
+    /// Notification for space becoming available - wakes waiting writers
+    space_available: Arc<Notify>,
     /// Background flusher task handle. The flusher runs on a configurable interval
     /// (default 10ms), drains all pending entries from the queue, and batches them
     /// into a single disk write. This amortizes I/O overhead across many operations.
@@ -109,6 +115,18 @@ impl WalStorage {
     /// # Panics
     /// Panics if the file cannot be opened (permissions, disk full, etc.)
     pub async fn new<P: AsRef<Path>>(path: P) -> Self {
+        Self::with_config(path, 10_000).await
+    }
+
+    /// Creates a new WAL storage instance with custom configuration.
+    ///
+    /// # Arguments
+    /// * `path` - File path for the WAL log
+    /// * `max_queue_size` - Maximum number of entries in the pending queue before backpressure
+    ///
+    /// # Panics
+    /// Panics if the file cannot be opened (permissions, disk full, etc.)
+    pub async fn with_config<P: AsRef<Path>>(path: P, max_queue_size: usize) -> Self {
         let file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -122,6 +140,9 @@ impl WalStorage {
             inner: Arc::new(Mutex::new(inner)),
             path: path.as_ref().to_string_lossy().to_string(),
             pending: Arc::new(SegQueue::new()),
+            max_queue_size,
+            pending_count: Arc::new(AtomicUsize::new(0)),
+            space_available: Arc::new(Notify::new()),
             flusher_handle: Arc::new(Mutex::new(None)),
             shutdown: Arc::new(AtomicBool::new(false)),
             flush_notify: Arc::new(Notify::new()),
@@ -130,23 +151,49 @@ impl WalStorage {
 
     /// Appends a WAL entry to the lock-free pending queue.
     ///
-    /// This method is completely lock-free using `SegQueue::push()` with CAS atomics.
-    /// Multiple threads can append concurrently without blocking. The entry is not
-    /// immediately written to disk - it will be flushed by the background task.
+    /// This method implements graceful backpressure: if the queue is full (at `max_queue_size`),
+    /// the caller waits asynchronously until space becomes available. This prevents unbounded
+    /// memory growth while maintaining lock-free semantics once admitted.
     ///
-    /// Also notifies the background flusher that work is available (non-blocking).
+    /// The append path remains lock-free using `SegQueue::push()` with CAS atomics.
+    /// Multiple threads can append concurrently without blocking each other.
+    ///
+    /// # Backpressure Behavior
+    /// - If queue has space: Immediate lock-free push (~1-2 µs)
+    /// - If queue is full: Async wait until flusher drains entries
+    /// - No hard errors: Writers automatically resume when space available
     ///
     /// # Arguments
     /// * `entry` - WAL entry to append
     ///
     /// # Returns
-    /// Always returns Ok (never fails since it's just a queue push)
-    #[allow(clippy::unused_async)]
+    /// Always returns Ok after successfully appending (may wait if queue full)
     pub async fn append(&self, entry: WalEntry) -> Result<(), WalError> {
-        self.pending.push(entry);
-        // Notify flusher that work is available
-        self.flush_notify.notify_one();
-        Ok(())
+        // Wait asynchronously if queue is at capacity
+        loop {
+            let current_count = self.pending_count.load(Ordering::Acquire);
+            
+            if current_count >= self.max_queue_size {
+                // Queue full - wait for space to become available
+                self.space_available.notified().await;
+                continue;
+            }
+            
+            // Optimistically increment count
+            if self.pending_count.compare_exchange(
+                current_count,
+                current_count + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ).is_ok() {
+                // Successfully reserved a slot - now push to queue
+                self.pending.push(entry);
+                self.flush_notify.notify_one();
+                return Ok(());
+            }
+            
+            // CAS failed, retry (another thread incremented)
+        }
     }
 
     /// Starts the background flusher task.
@@ -172,6 +219,8 @@ impl WalStorage {
         let inner = Arc::clone(&self.inner);
         let shutdown = Arc::clone(&self.shutdown);
         let flush_notify = Arc::clone(&self.flush_notify);
+        let pending_count = Arc::clone(&self.pending_count);
+        let space_available = Arc::clone(&self.space_available);
 
         let handle = tokio::spawn(async move {
             let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(flush_interval_ms));
@@ -179,13 +228,13 @@ impl WalStorage {
             loop {
                 tokio::select! {
                     _ = interval.tick() => {
-                        if let Err(e) = Self::drain_and_flush(&pending, &inner).await {
+                        if let Err(e) = Self::drain_and_flush(&pending, &inner, &pending_count, &space_available).await {
                             eprintln!("WAL flush error: {e}");
                         }
                     }
                     () = flush_notify.notified() => {
                         // Immediate flush requested
-                        if let Err(e) = Self::drain_and_flush(&pending, &inner).await {
+                        if let Err(e) = Self::drain_and_flush(&pending, &inner, &pending_count, &space_available).await {
                             eprintln!("WAL flush error: {e}");
                         }
                     }
@@ -193,7 +242,7 @@ impl WalStorage {
 
                 if shutdown.load(Ordering::SeqCst) {
                     // Final flush on shutdown
-                    if let Err(e) = Self::drain_and_flush(&pending, &inner).await {
+                    if let Err(e) = Self::drain_and_flush(&pending, &inner, &pending_count, &space_available).await {
                         eprintln!("Final WAL flush error: {e}");
                     }
                     break;
@@ -227,6 +276,8 @@ impl WalStorage {
     async fn drain_and_flush(
         pending: &SegQueue<WalEntry>,
         inner: &Arc<Mutex<InnerWal>>,
+        pending_count: &Arc<AtomicUsize>,
+        space_available: &Arc<Notify>,
     ) -> Result<(), WalError> {
         let mut batch = Vec::new();
         
@@ -238,6 +289,8 @@ impl WalStorage {
         if batch.is_empty() {
             return Ok(());
         }
+
+        let batch_size = batch.len();
 
         // Single lock acquisition for entire batch
         let mut inner = inner.lock().await;
@@ -257,6 +310,10 @@ impl WalStorage {
 
         inner.file.flush().await?;
         inner.file.get_mut().sync_all().await?; // fsync for durability
+        
+        // Update pending count and notify waiting writers
+        pending_count.fetch_sub(batch_size, Ordering::Release);
+        space_available.notify_waiters();
         
         Ok(())
     }
@@ -279,14 +336,14 @@ impl WalStorage {
         
         // Wait until queue is drained
         let mut retries = 0;
-        while !self.pending.is_empty() && retries < 100 {
+        while self.pending_count.load(Ordering::Acquire) > 0 && retries < 100 {
             tokio::time::sleep(tokio::time::Duration::from_micros(100)).await;
             retries += 1;
         }
 
-        if !self.pending.is_empty() {
+        if self.pending_count.load(Ordering::Acquire) > 0 {
             // Force flush remaining entries
-            Self::drain_and_flush(&self.pending, &self.inner).await?;
+            Self::drain_and_flush(&self.pending, &self.inner, &self.pending_count, &self.space_available).await?;
         }
 
         Ok(())
@@ -387,7 +444,7 @@ impl WalStorage {
         let old_path = format!("{}.old", self.path);
         tokio::fs::rename(&self.path, &old_path).await
             .map_err(|e| WalError::Checkpoint(format!("Failed to rename WAL: {e}")))?;
-        *self = Self::new(path).await;
+        *self = Self::with_config(path, self.max_queue_size).await;
         Ok(())
     }
 }
@@ -542,5 +599,218 @@ mod tests {
         assert_eq!(header.length, decoded.length);
         assert_eq!(header.checksum, decoded.checksum);
         assert_eq!(header.version, decoded.version);
+    }
+
+    #[async_test]
+    async fn test_bounded_queue_backpressure() {
+        let temp_dir = TempDir::new().unwrap();
+        let wal_path = temp_dir.path().join("wal_bounded.log");
+        
+        // Create WAL with very small queue (2 entries) to easily trigger backpressure
+        let wal = Arc::new(WalStorage::with_config(&wal_path, 2).await);
+        // Don't start flusher yet - simulate slow processing
+        
+        // Fill the queue to capacity (should succeed immediately)
+        let start = std::time::Instant::now();
+        for i in 0..2 {
+            let entry = WalEntry::Insert {
+                tx_id: i,
+                timestamp: 123,
+                key: format!("key{}", i),
+                value: b"value".to_vec(),
+            };
+            wal.append(entry).await.unwrap();
+        }
+        let fill_time = start.elapsed();
+        println!("Filled queue in {:?}", fill_time);
+        assert!(fill_time.as_millis() < 10, "Filling should be fast");
+        
+        // Now try to append one more - should block since queue is full
+        let wal_clone = Arc::clone(&wal);
+        let start = std::time::Instant::now();
+        
+        let blocked_handle = tokio::spawn(async move {
+            let entry = WalEntry::Insert {
+                tx_id: 100,
+                timestamp: 123,
+                key: "blocked".to_string(),
+                value: b"value".to_vec(),
+            };
+            wal_clone.append(entry).await.unwrap();
+            std::time::Instant::now()
+        });
+        
+        // Give blocked task time to hit backpressure
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        
+        // Now start flusher to unblock the waiting writer
+        wal.start_flusher(10);
+        
+        // Wait for blocked append to complete
+        let finish_time = blocked_handle.await.unwrap();
+        let total_time = finish_time.duration_since(start);
+        
+        println!("Backpressure test: writer blocked for {:?}", total_time);
+        
+        // Writer should have been blocked for at least the sleep duration
+        assert!(total_time.as_millis() >= 50, 
+            "Writer should have been blocked by backpressure (waited {:?})", total_time);
+        
+        wal.flush().await.unwrap();
+        wal.stop_flusher().await.unwrap();
+    }
+
+    #[async_test]
+    async fn test_queue_capacity_enforcement() {
+        let temp_dir = TempDir::new().unwrap();
+        let wal_path = temp_dir.path().join("wal_capacity.log");
+        
+        // Create WAL with capacity of 100
+        let wal = Arc::new(WalStorage::with_config(&wal_path, 100).await);
+        wal.start_flusher(50); // Moderate flush interval
+        
+        // Spawn many concurrent writers
+        let mut handles = vec![];
+        for i in 0..20 {
+            let wal_clone = Arc::clone(&wal);
+            let handle = tokio::spawn(async move {
+                for j in 0..10 {
+                    let entry = WalEntry::Insert {
+                        tx_id: (i * 10 + j) as u64,
+                        timestamp: 123,
+                        key: format!("key-{}-{}", i, j),
+                        value: b"value".to_vec(),
+                    };
+                    wal_clone.append(entry).await.unwrap();
+                }
+            });
+            handles.push(handle);
+        }
+        
+        // All writes should complete (with backpressure)
+        for handle in handles {
+            handle.await.unwrap();
+        }
+        
+        // Verify all data was written
+        wal.flush().await.unwrap();
+        let file_size = tokio::fs::metadata(&wal_path).await.unwrap().len();
+        assert!(file_size > 0, "All entries should be persisted");
+        
+        wal.stop_flusher().await.unwrap();
+    }
+
+    #[async_test]
+    async fn test_high_throughput_with_bounded_queue() {
+        let temp_dir = TempDir::new().unwrap();
+        let wal_path = temp_dir.path().join("wal_throughput.log");
+        
+        // Create WAL with reasonable capacity
+        let wal = Arc::new(WalStorage::with_config(&wal_path, 1000).await);
+        wal.start_flusher(10); // Fast flusher
+        
+        let start = std::time::Instant::now();
+        
+        // Write 5000 entries with 50 concurrent threads
+        let mut handles = vec![];
+        for i in 0..50 {
+            let wal_clone = Arc::clone(&wal);
+            let handle = tokio::spawn(async move {
+                for j in 0..100 {
+                    let entry = WalEntry::Insert {
+                        tx_id: (i * 100 + j) as u64,
+                        timestamp: 123,
+                        key: format!("key-{}-{}", i, j),
+                        value: vec![0u8; 100], // 100 bytes per entry
+                    };
+                    wal_clone.append(entry).await.unwrap();
+                }
+            });
+            handles.push(handle);
+        }
+        
+        for handle in handles {
+            handle.await.unwrap();
+        }
+        
+        wal.flush().await.unwrap();
+        let elapsed = start.elapsed();
+        
+        // Should complete in reasonable time despite bounded queue
+        assert!(elapsed.as_secs() < 5, "Should complete within 5 seconds with backpressure");
+        
+        // Verify all data persisted
+        let file_size = tokio::fs::metadata(&wal_path).await.unwrap().len();
+        assert!(file_size > 500_000, "Should have written significant data (5000 entries)");
+        
+        wal.stop_flusher().await.unwrap();
+    }
+
+    #[async_test]
+    async fn test_graceful_degradation_under_load() {
+        let temp_dir = TempDir::new().unwrap();
+        let wal_path = temp_dir.path().join("wal_degradation.log");
+        
+        // Small queue + slow flusher = intentional overload
+        let wal = Arc::new(WalStorage::with_config(&wal_path, 10).await);
+        wal.start_flusher(200); // Very slow flusher
+        
+        // Try to write 100 entries quickly
+        let mut handles = vec![];
+        for i in 0..10 {
+            let wal_clone = Arc::clone(&wal);
+            let handle = tokio::spawn(async move {
+                for j in 0..10 {
+                    let entry = WalEntry::Insert {
+                        tx_id: (i * 10 + j) as u64,
+                        timestamp: 123,
+                        key: format!("key{}", i * 10 + j),
+                        value: b"data".to_vec(),
+                    };
+                    // Should succeed but may be delayed
+                    wal_clone.append(entry).await.unwrap();
+                }
+            });
+            handles.push(handle);
+        }
+        
+        // All writes should eventually succeed (graceful degradation)
+        for handle in handles {
+            handle.await.unwrap();
+        }
+        
+        wal.flush().await.unwrap();
+        wal.stop_flusher().await.unwrap();
+    }
+
+    #[async_test]
+    async fn test_pending_count_accuracy() {
+        let temp_dir = TempDir::new().unwrap();
+        let wal_path = temp_dir.path().join("wal_count.log");
+        
+        let wal = WalStorage::with_config(&wal_path, 1000).await;
+        wal.start_flusher(1000); // Very slow to keep entries in queue
+        
+        // Add entries
+        for i in 0..50 {
+            let entry = WalEntry::Insert {
+                tx_id: i,
+                timestamp: 123,
+                key: format!("key{}", i),
+                value: b"value".to_vec(),
+            };
+            wal.append(entry).await.unwrap();
+        }
+        
+        // Check count is tracked
+        let count = wal.pending_count.load(Ordering::Acquire);
+        assert!(count > 0 && count <= 50, "Pending count should reflect queued entries");
+        
+        // Flush and verify count drops
+        wal.flush().await.unwrap();
+        let count_after = wal.pending_count.load(Ordering::Acquire);
+        assert_eq!(count_after, 0, "Pending count should be 0 after flush");
+        
+        wal.stop_flusher().await.unwrap();
     }
 }

@@ -5,7 +5,7 @@ mod lmdb_storage;
 
 pub use wal_storage::WalStorage;
 pub use transaction::{Transaction, TxState};
-pub use database::Database;
+pub use database::{Database, DatabaseConfig};
 pub use lmdb_storage::LmdbStorage;
 
 use serde::{Deserialize, Serialize};

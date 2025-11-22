@@ -19,13 +19,99 @@ pub struct Database {
     pub wal: WalStorage,
 }
 
+/// Configuration builder for Database with sensible defaults.
+///
+/// # Example
+/// ```ignore
+/// let db = DatabaseConfig::new("wal.log")
+///     .with_max_queue_size(20_000)
+///     .with_flush_interval_ms(5)
+///     .build()
+///     .await;
+/// ```
+pub struct DatabaseConfig {
+    wal_path: String,
+    max_queue_size: usize,
+    flush_interval_ms: u64,
+}
+
+impl DatabaseConfig {
+    /// Creates a new configuration with defaults.
+    ///
+    /// Defaults:
+    /// - `max_queue_size`: 10,000 entries
+    /// - `flush_interval_ms`: 10ms
+    ///
+    /// # Arguments
+    /// * `wal_path` - File path for the WAL log
+    pub fn new(wal_path: impl Into<String>) -> Self {
+        Self {
+            wal_path: wal_path.into(),
+            max_queue_size: 10_000,
+            flush_interval_ms: 10,
+        }
+    }
+
+    /// Sets the maximum queue size before backpressure is applied.
+    ///
+    /// When the pending queue reaches this size, writers will wait asynchronously
+    /// until the background flusher drains entries.
+    ///
+    /// # Recommendations
+    /// - Low latency workloads: 1,000 - 5,000
+    /// - High throughput: 10,000 - 50,000
+    /// - Memory constrained: 500 - 2,000
+    ///
+    /// # Arguments
+    /// * `size` - Maximum number of pending entries
+    #[must_use]
+    pub fn with_max_queue_size(mut self, size: usize) -> Self {
+        self.max_queue_size = size;
+        self
+    }
+
+    /// Sets the background flusher interval in milliseconds.
+    ///
+    /// Lower values reduce write latency but increase CPU/disk I/O overhead.
+    /// Higher values improve throughput but increase latency.
+    ///
+    /// # Recommendations
+    /// - Low latency: 1-5ms
+    /// - Balanced: 10ms (default)
+    /// - High throughput: 20-50ms
+    ///
+    /// # Arguments
+    /// * `ms` - Milliseconds between flush attempts
+    #[must_use]
+    pub fn with_flush_interval_ms(mut self, ms: u64) -> Self {
+        self.flush_interval_ms = ms;
+        self
+    }
+
+    /// Builds the database with the configured settings.
+    ///
+    /// # Returns
+    /// Arc-wrapped Database instance ready for use
+    pub async fn build(self) -> Arc<Database> {
+        let wal = WalStorage::with_config(&self.wal_path, self.max_queue_size).await;
+        wal.start_flusher(self.flush_interval_ms);
+        Arc::new(Database {
+            store: Arc::new(RwLock::new(HashMap::new())),
+            wal,
+        })
+    }
+}
+
 impl Database {
-    /// Creates a new database instance with the specified WAL path.
+    /// Creates a new database instance with default configuration.
     ///
     /// This method:
     /// 1. Initializes the WAL storage at the given path
     /// 2. Starts the background flusher with a 10ms interval
     /// 3. Creates an empty in-memory `HashMap` store
+    /// 4. Sets max queue size to 10,000 entries
+    ///
+    /// For custom configuration, use `DatabaseConfig::new()` instead.
     ///
     /// The database is ready to accept transactions immediately after creation.
     /// To restore from existing WAL, call `recover()` after `new()`.
@@ -36,13 +122,7 @@ impl Database {
     /// # Returns
     /// Arc-wrapped Database instance for shared ownership across threads
     pub async fn new(wal_path: &str) -> Arc<Self> {
-        let wal = WalStorage::new(wal_path).await;
-        // Start background flusher with 10ms interval
-        wal.start_flusher(10);
-        Arc::new(Self {
-            store: Arc::new(RwLock::new(HashMap::new())),
-            wal,
-        })
+        DatabaseConfig::new(wal_path).build().await
     }
 
     /// Begins a new transaction with a unique ID.
